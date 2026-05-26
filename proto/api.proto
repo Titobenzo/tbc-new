@@ -413,6 +413,56 @@ message RaidSimResultCombinationRequest {
 	repeated RaidSimResult results = 1;
 }
 
+// A batch of independent raid sims (e.g. bulk gear comparison). Each request is run
+// independently and the results are returned in the same order.
+message BulkSimRequest {
+	repeated RaidSimRequest requests = 1;
+}
+
+message BulkSimResult {
+	repeated RaidSimResult results = 1; // One per request in BulkSimRequest, in order.
+}
+
+// One item assigned to one slot, within a combination choice.
+message BulkComboSlotItem {
+	ItemSlot slot = 1;
+	ItemSpec item = 2;
+}
+
+// One option within a combination dimension - assigns one or more items to slots (a single
+// armor piece, a ring/trinket pair, or a weapon configuration).
+message BulkComboChoice {
+	repeated BulkComboSlotItem items = 1;
+}
+
+// One axis of the combination space (e.g. the helm options, or the ring pairs, or the weapon
+// configs). The full set of combinations is the cartesian product across all dimensions.
+message BulkComboDimension {
+	repeated BulkComboChoice choices = 1;
+}
+
+// Full server-side bulk gear comparison. The frontend computes the combination space (the
+// per-slot/weapon/pair option lists - cheap, O(options)) and sends it as `dimensions`; the
+// server expands the cartesian product, applies each combo to the base gear, gems and sims it,
+// and returns ranked results. All the heavy work (the product, gemming, simming) is on the
+// native backend; the browser only sends the option lists it already computes for display.
+message BulkComboSimRequest {
+	RaidSimRequest base = 1;                    // Full sim config; player 0's gear is varied per combination.
+	repeated BulkComboDimension dimensions = 2; // The combination space (frontend-computed option lists).
+	BulkSettings settings = 3;                  // Fallback gems + iterations_per_combo (+ optimizer settings later).
+}
+
+message RankedGearResult {
+	EquipmentSpec equipment = 1; // The gear set (with its chosen gems/enchants).
+	DistributionMetrics dps = 2;
+}
+
+message BulkComboSimResult {
+	repeated RankedGearResult ranked = 1; // Top sets, best DPS first.
+	RankedGearResult baseline = 2;        // The currently-equipped gear, for comparison.
+	int32 total_combinations = 3;
+}
+
 message AbortRequest {
 	string request_id = 1; // The request that should be aborted.
 }
@@ -592,6 +642,8 @@ message ProgressMetrics {
 	// Final Results
 	RaidSimResult final_raid_result = 6; // only set when completed
 	StatWeightsResult final_weight_result = 7;
+	BulkSimResult final_bulk_result = 10; // only set when a bulk run completes
+	BulkComboSimResult final_combo_result = 11; // only set when a full bulk-combo run completes
 }
 
 message BulkSettings {
@@ -608,4 +660,35 @@ message BulkSettings {
 	int32 freeze_weapon_slot = 10;
 	repeated WeaponType freeze_mainhand_weapon_slots = 11;
 	repeated WeaponType freeze_offhand_weapon_slots = 12;
+
+	// Gem optimization (Suggest Gems, ported to the backend). When optimize_gems is set, the runner
+	// re-gems each combination to maximize EP subject to the stat caps before simming it.
+	bool optimize_gems = 13;
+	repeated double gem_ep_weights = 14;      // pre-cap EP weight per stat (stats.Stats float-array form)
+	repeated double gem_stat_caps = 15;       // deprecated; superseded by gem_caps
+	repeated double gem_pseudostat_caps = 16; // deprecated; superseded by gem_caps
+	// General stat caps / soft-cap breakpoints, exactly as configured in Suggest Gems. Each is a
+	// piecewise EP curve: pre-cap EP (from gem_ep_weights) up to breakpoints[0], then post_cap_eps[i]
+	// between breakpoints[i] and [i+1]. Covers hard caps (post_cap_eps ending in 0) and soft caps.
+	repeated GemStatCap gem_caps = 17;
+	bool disable_unique_gems = 18; // exclude unique-equipped gems from the optimizer entirely
+	// The exact gem ids the optimizer may use (already filtered by phase, profession, etc. on the
+	// client). When set, the backend pool is restricted to these; empty falls back to all loaded gems.
+	repeated int32 gem_pool_ids = 19;
+	// The configured/effective meta gem's activation condition, resolved on the client via
+	// getMetaGemCondition. The optimizer constrains gem colors so the meta gem stays active (matches
+	// Suggest Gems). min_* are minimum counts of each color (hybrids count for both); compare_color_*
+	// encode a "more X than Y" rule (GemColor enum values; 0/Unknown = no compare rule).
+	int32 meta_min_red = 20;
+	int32 meta_min_yellow = 21;
+	int32 meta_min_blue = 22;
+	int32 meta_compare_color_greater = 23;
+	int32 meta_compare_color_lesser = 24;
+}
+
+message GemStatCap {
+	int32 unit_stat = 1;              // Stat index, or PseudoStat index when is_pseudostat
+	bool is_pseudostat = 2;
+	repeated double breakpoints = 3;  // ascending, in the stat's own unit (percent for pseudostats)
+	repeated double post_cap_eps = 4; // per-rating EP in each segment after the matching breakpoint
 }

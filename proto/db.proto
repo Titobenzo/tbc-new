@@ -77,4 +77,5 @@ message SimGem {
 	GemColor color = 3;
 	repeated double stats = 4;
 	bool disabled_in_challenge_mode = 5;
+	bool unique = 6; // unique-equipped: at most one may be socketed
 }

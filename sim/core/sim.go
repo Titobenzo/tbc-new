@@ -34,6 +34,11 @@ type Simulation struct {
 	isTest    bool
 	testRands map[string]Rand
 
+	// When set, run() returns only the raid DPS/HPS distributions and skips building the full
+	// per-unit/spell/aura/pet metrics tree. Bulk gear ranking reads only the raid DPS, so this
+	// avoids a large fixed per-sim cost. Does not affect the simulation itself.
+	dpsOnly bool
+
 	// Current Simulation State
 	pendingActions    []*PendingAction
 	pendingActionPool *sync.Pool
@@ -354,9 +359,21 @@ func (sim *Simulation) run() *proto.RaidSimResult {
 		}
 		totalDuration += iterDuration
 	}
+	var raidMetrics *proto.RaidMetrics
+	var encounterMetrics *proto.EncounterMetrics
+	if sim.dpsOnly {
+		// Ranking reads only the raid DPS/HPS; skip building the full per-unit/spell/aura/pet tree.
+		raidMetrics = &proto.RaidMetrics{
+			Dps: sim.Raid.dpsMetrics.ToProto(),
+			Hps: sim.Raid.hpsMetrics.ToProto(),
+		}
+	} else {
+		raidMetrics = sim.Raid.GetMetrics()
+		encounterMetrics = sim.Encounter.GetMetricsProto()
+	}
 	result := &proto.RaidSimResult{
-		RaidMetrics:      sim.Raid.GetMetrics(),
-		EncounterMetrics: sim.Encounter.GetMetricsProto(),
+		RaidMetrics:      raidMetrics,
+		EncounterMetrics: encounterMetrics,
 
 		Logs:                   logsBuffer.String(),
 		FirstIterationDuration: firstIterationDuration.Seconds(),

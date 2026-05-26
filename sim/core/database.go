@@ -21,11 +21,64 @@ var ItemEffectRandPropPointsByIlvl = map[int32]ItemEffectRandPropPoints{}
 var ConsumablesByID = map[int32]Consumable{}
 var SpellEffectsById = map[int32]*proto.SpellEffect{}
 
-var mutex = &sync.Mutex{}
+// Guards the global database maps below. addToDatabase (the only writer, called per-request
+// when a sim's gear database is merged in) takes the write lock; readers that run concurrently
+// with sims (NewItem, GetItemByID) take the read lock. Previously only writers locked, so a
+// concurrent batch (many sims building characters at once) could read a map mid-write and the
+// Go runtime would abort with "concurrent map read and map write".
+var mutex = &sync.RWMutex{}
+
+// databaseHasAll reports whether every entry in newDB is already in the global database, under the
+// read lock so concurrent callers don't block one another.
+func databaseHasAll(newDB *proto.SimDatabase) bool {
+	mutex.RLock()
+	defer mutex.RUnlock()
+	for _, v := range newDB.Items {
+		if _, ok := ItemsByID[v.Id]; !ok {
+			return false
+		}
+	}
+	for _, v := range newDB.RandomSuffixes {
+		if _, ok := RandomSuffixesByID[v.Id]; !ok {
+			return false
+		}
+	}
+	for _, v := range newDB.Enchants {
+		if _, ok := EnchantsByEffectID[v.EffectId]; !ok {
+			return false
+		}
+	}
+	for _, v := range newDB.Gems {
+		if _, ok := GemsByID[v.Id]; !ok {
+			return false
+		}
+	}
+	for _, v := range newDB.ItemEffectRandPropPoints {
+		if _, ok := ItemEffectRandPropPointsByIlvl[v.Ilvl]; !ok {
+			return false
+		}
+	}
+	for _, v := range newDB.Consumables {
+		if _, ok := ConsumablesByID[v.Id]; !ok {
+			return false
+		}
+	}
+	for _, v := range newDB.SpellEffects {
+		if _, ok := SpellEffectsById[v.Id]; !ok {
+			return false
+		}
+	}
+	return true
+}
 
 func addToDatabase(newDB *proto.SimDatabase) {
-	// create mutex lock here and lock it
-	// defer unlock it
+	// Fast path: once the database is warmed, every entry is already present (e.g. every combo in a
+	// bulk run carries the same merged database). Confirm that under the shared read lock and return,
+	// so concurrent character builds don't serialize on the exclusive write lock below.
+	if databaseHasAll(newDB) {
+		return
+	}
+
 	mutex.Lock()
 	defer mutex.Unlock()
 
@@ -216,18 +269,20 @@ func EnchantFromProto(pData *proto.SimEnchant) Enchant {
 }
 
 type Gem struct {
-	ID    int32
-	Name  string
-	Stats stats.Stats
-	Color proto.GemColor
+	ID     int32
+	Name   string
+	Stats  stats.Stats
+	Color  proto.GemColor
+	Unique bool
 }
 
 func GemFromProto(pData *proto.SimGem) Gem {
 	return Gem{
-		ID:    pData.Id,
-		Name:  pData.Name,
-		Stats: stats.FromProtoArray(pData.Stats),
-		Color: pData.Color,
+		ID:     pData.Id,
+		Name:   pData.Name,
+		Stats:  stats.FromProtoArray(pData.Stats),
+		Color:  pData.Color,
+		Unique: pData.Unique,
 	}
 }
 
@@ -412,6 +467,9 @@ func ProtoToEquipmentSpec(es *proto.EquipmentSpec) EquipmentSpec {
 }
 
 func NewItem(itemSpec ItemSpec) Item {
+	mutex.RLock()
+	defer mutex.RUnlock()
+
 	item := Item{}
 	if foundItem, ok := ItemsByID[itemSpec.ID]; ok {
 		item = foundItem
@@ -565,6 +623,9 @@ func ItemEquipmentGemAndEnchantStats(item Item) stats.Stats {
 }
 
 func GetItemByID(id int32) *Item {
+	mutex.RLock()
+	defer mutex.RUnlock()
+
 	if item, ok := ItemsByID[id]; ok {
 		return &item
 	}

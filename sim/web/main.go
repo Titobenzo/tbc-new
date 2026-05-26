@@ -14,7 +14,6 @@ import (
 	"runtime/pprof"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -120,6 +119,12 @@ var asyncAPIHandlers = map[string]asyncAPIHandler{
 	"/statWeightsAsync": {msg: func() googleProto.Message { return &proto.StatWeightsRequest{} }, handle: func(msg googleProto.Message, reporter chan *proto.ProgressMetrics, requestId string) {
 		core.StatWeightsAsync(msg.(*proto.StatWeightsRequest), reporter, requestId)
 	}},
+	"/bulkSimAsync": {msg: func() googleProto.Message { return &proto.BulkSimRequest{} }, handle: func(msg googleProto.Message, reporter chan *proto.ProgressMetrics, requestId string) {
+		core.RunBulkSimConcurrentAsync(msg.(*proto.BulkSimRequest), reporter, requestId)
+	}},
+	"/bulkComboSimAsync": {msg: func() googleProto.Message { return &proto.BulkComboSimRequest{} }, handle: func(msg googleProto.Message, reporter chan *proto.ProgressMetrics, requestId string) {
+		core.RunBulkComboSimConcurrentAsync(msg.(*proto.BulkComboSimRequest), reporter, requestId)
+	}},
 }
 
 type server struct {
@@ -137,16 +142,36 @@ type asyncAPIHandler struct {
 }
 
 type asyncProgress struct {
-	id             string
-	latestProgress atomic.Value
+	id string
+
+	mu      sync.Mutex
+	latest  *proto.ProgressMetrics
+	updated chan struct{} // closed (and replaced) whenever latest changes; lets pollers block until there is new data
+}
+
+// store records the newest progress and wakes any long-poll requests blocked in waitForUpdate().
+func (ap *asyncProgress) store(p *proto.ProgressMetrics) {
+	ap.mu.Lock()
+	ap.latest = p
+	close(ap.updated)
+	ap.updated = make(chan struct{})
+	ap.mu.Unlock()
+}
+
+// load returns the latest progress plus a channel that closes when newer progress arrives.
+func (ap *asyncProgress) load() (*proto.ProgressMetrics, chan struct{}) {
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	return ap.latest, ap.updated
 }
 
 func (s *server) addNewSim() *asyncProgress {
 	newID := uuid.NewString()
 	simProgress := &asyncProgress{
-		id: newID,
+		id:      newID,
+		latest:  &proto.ProgressMetrics{},
+		updated: make(chan struct{}),
 	}
-	simProgress.latestProgress.Store(&proto.ProgressMetrics{})
 
 	s.progMut.Lock()
 	s.asyncProgresses[newID] = simProgress
@@ -199,8 +224,8 @@ func (s *server) handleAsyncAPI(w http.ResponseWriter, r *http.Request) {
 				if progMetric == nil {
 					return
 				}
-				simProgress.latestProgress.Store(progMetric)
-				if progMetric.FinalRaidResult != nil || progMetric.FinalWeightResult != nil {
+				simProgress.store(progMetric)
+				if progMetric.FinalRaidResult != nil || progMetric.FinalWeightResult != nil || progMetric.FinalBulkResult != nil || progMetric.FinalComboResult != nil {
 					return
 				}
 			}
@@ -249,7 +274,22 @@ func (s *server) setupAsyncServer() {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		latest := progress.latestProgress.Load().(*proto.ProgressMetrics)
+		latest, updated := progress.load()
+
+		// Long-poll: if there is nothing final to report yet, hold the request open until the
+		// next progress update, the client disconnects, or a keepalive timeout. This lets the
+		// client learn of progress/completion immediately without busy-polling on a timer.
+		if latest.FinalRaidResult == nil && latest.FinalWeightResult == nil && latest.FinalBulkResult == nil && latest.FinalComboResult == nil {
+			select {
+			case <-updated:
+				latest, _ = progress.load()
+			case <-r.Context().Done():
+				return
+			case <-time.After(15 * time.Second):
+				// keepalive: fall through and return whatever we currently have
+			}
+		}
+
 		outbytes, err := googleProto.Marshal(latest)
 		if err != nil {
 			log.Printf("[ERROR] Failed to marshal result: %s", err.Error())
@@ -258,7 +298,7 @@ func (s *server) setupAsyncServer() {
 		}
 
 		// If this was the last result, delete the cache for this simulation.
-		if latest.FinalRaidResult != nil || latest.FinalWeightResult != nil {
+		if latest.FinalRaidResult != nil || latest.FinalWeightResult != nil || latest.FinalBulkResult != nil || latest.FinalComboResult != nil {
 			s.progMut.Lock()
 			delete(s.asyncProgresses, msg.ProgressId)
 			s.progMut.Unlock()
@@ -402,7 +442,7 @@ func (s *server) runServer(useFS bool, host string, launchBrowser bool, simName 
 			s.progMut.RLock()
 			fmt.Printf("Total Sims Running: %d\n", len(s.asyncProgresses))
 			for _, v := range s.asyncProgresses {
-				latest := (v.latestProgress.Load()).(*proto.ProgressMetrics)
+				latest, _ := v.load()
 				fmt.Printf("Process: %s (%d sims)\n\t  Progress: %d/%d\n", v.id, latest.TotalSims, latest.CompletedIterations, latest.TotalIterations)
 			}
 			s.progMut.RUnlock()
