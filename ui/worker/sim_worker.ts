@@ -29,6 +29,14 @@ globalThis.wasmready = function () {
 		raidSim: raidSim,
 		raidSimJson: raidSimJson,
 		raidSimAsync: raidSimAsync,
+		// The wasm lib has no native-threaded bulk runner; batch falls back to per-combo sims in
+		// wasm mode (see Sim.runBulkSim), so this is never invoked here. Stub it to satisfy the type.
+		bulkSimAsync: () => {
+			throw new Error('bulkSimAsync is not supported by the wasm worker');
+		},
+		bulkComboSimAsync: () => {
+			throw new Error('bulkComboSimAsync is not supported by the wasm worker');
+		},
 		statWeights: statWeights,
 		statWeightsAsync: statWeightsAsync,
 		statWeightRequests: statWeightRequests,

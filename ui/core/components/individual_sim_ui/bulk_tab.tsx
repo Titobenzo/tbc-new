@@ -6,18 +6,29 @@ import { ref } from 'tsx-vanilla';
 import { REPO_RELEASES_URL } from '../../constants/other';
 import { IndividualSimUI } from '../../individual_sim_ui';
 import i18n from '../../../i18n/config';
-import { BulkSettings, DistributionMetrics, ProgressMetrics, RaidSimResult } from '../../proto/api';
-import { GemColor, HandType, ItemRandomSuffix, ItemSlot, ItemSpec, RangedWeaponType, WeaponType } from '../../proto/common';
+import {
+	BulkComboChoice,
+	BulkComboDimension,
+	BulkComboSimRequest,
+	BulkComboSlotItem,
+	BulkSettings,
+	DistributionMetrics,
+	GemStatCap,
+	ProgressMetrics,
+	RaidSimRequest,
+	RaidSimResult,
+} from '../../proto/api';
+import { GemColor, HandType, ItemRandomSuffix, ItemSlot, ItemSpec, Profession, RangedWeaponType, WeaponType } from '../../proto/common';
 import { ItemEffectRandPropPoints, SimDatabase, SimEnchant, SimGem, SimItem } from '../../proto/db';
 import { UIEnchant, UIGem, UIItem } from '../../proto/ui';
 import { ActionId } from '../../proto_utils/action_id';
 import { EquippedItem } from '../../proto_utils/equipped_item';
 import { Gear } from '../../proto_utils/gear';
-import { getEmptyGemSocketIconUrl } from '../../proto_utils/gems';
+import { getEmptyGemSocketIconUrl, getMetaGemCondition } from '../../proto_utils/gems';
 import { canEquipItem, getEligibleItemSlots, isSecondaryItemSlot } from '../../proto_utils/utils';
 import { RequestTypes } from '../../sim_signal_manager';
 import { TypedEvent } from '../../typed_event';
-import { getEnumValues, isExternal, promisePool, sleep } from '../../utils';
+import { formatDuration, formatToCompactNumber, formatToNumber, getEnumValues, isExternal, runWithConcurrency, sleep } from '../../utils';
 import { ItemData } from '../gear_picker/item_list';
 import SelectorModal from '../gear_picker/selector_modal';
 import { SimTab } from '../sim_tab';
@@ -39,6 +50,7 @@ import { trackEvent } from '../../../tracking/utils';
 import { EnumPicker } from '../pickers/enum_picker';
 import { translateBulkSlotName, translateWeaponType } from '../../../i18n/localization';
 import { BooleanPicker } from '../pickers/boolean_picker';
+import { NumberPicker } from '../pickers/number_picker';
 import { ProgressTrackerModal } from '../progress_tracker_modal';
 
 const WEB_DEFAULT_ITERATIONS = 5_000;
@@ -81,6 +93,20 @@ export class BulkTab extends SimTab {
 	protected isRunning: boolean = false;
 	protected isCancelling = false;
 	protected bulkSimAbortController: AbortController | null = null;
+
+	// Optimize each combination's gems (socket bonuses, meta-gem conditions, stat caps) with the
+	// same LP engine as the "Suggest Gems" feature, instead of just filling sockets with the
+	// fallback gems. In this MoP-derived code that engine also does reforging, which is a no-op in
+	// TBC, so here it is effectively a per-combo gem optimizer. Off = fast crude fallback-gem fill.
+	protected optimizeGems = true;
+
+	// Iterations to run per combination. 0 means "use the default". Batch runs are a
+	// ranking pass, so this is intentionally lower than a final single-sim count.
+	protected batchIterations = 0;
+
+	// Enchant options to try per item slot (enchant effectIds). Each slot with options becomes (or
+	// extends) a combination dimension: the slot's item(s) are cross-producted with these enchants.
+	protected enchantOptions: Map<ItemSlot, number[]> = new Map();
 
 	frozenItems: Map<BulkSimItemSlot, EquippedItem | null> = new Map([
 		[BulkSimItemSlot.ItemSlotFinger, null],
@@ -264,6 +290,7 @@ export class BulkTab extends SimTab {
 			}
 
 			this.addItems(settings.items, true);
+			this.batchIterations = settings.iterationsPerCombo;
 			this.setFrozenItem(BulkSimItemSlot.ItemSlotFinger, this.getEquippedItemForFrozenSlot(BulkSimItemSlot.ItemSlotFinger, settings.freezeRingSlot));
 			this.setFrozenItem(BulkSimItemSlot.ItemSlotTrinket, this.getEquippedItemForFrozenSlot(BulkSimItemSlot.ItemSlotTrinket, settings.freezeTrinketSlot));
 			this.setFrozenWeaponSlot(settings.freezeWeaponSlot);
@@ -287,6 +314,10 @@ export class BulkTab extends SimTab {
 						}
 					});
 			});
+
+			// The pickers were built (synchronously) before this deferred load ran, so they're showing
+			// construction-time defaults. Emit so they re-read the values we just loaded from storage.
+			this.settingsChangedEmitter.emit(TypedEvent.nextEventID());
 		}
 	}
 
@@ -303,6 +334,32 @@ export class BulkTab extends SimTab {
 	}
 
 	protected createBulkSettings(): BulkSettings {
+		// Gem optimizer inputs: the player's EP weights, the Suggest Gems hard stat caps, and the
+		// soft-cap breakpoints (e.g. hunter's 9% ranged-hit) as percent caps the backend converts to
+		// per-combo rating caps. Falls back to the spec defaults when the reforger isn't instantiated.
+		const statCaps = this.simUI.reforger?.statCaps ?? this.simUI.individualConfig.defaults.statCaps;
+		const softCaps = this.simUI.reforger?.softCapsConfig ?? this.simUI.individualConfig.defaults.softCapBreakpoints ?? [];
+		const gemCaps: GemStatCap[] = [];
+		// Soft-cap breakpoints, sent as full piecewise curves (breakpoints + post-cap EPs).
+		for (const cap of softCaps) {
+			if (!cap.breakpoints.length) continue;
+			gemCaps.push(
+				GemStatCap.create({
+					unitStat: cap.unitStat.isPseudoStat() ? cap.unitStat.getPseudoStat() : cap.unitStat.getStat(),
+					isPseudostat: cap.unitStat.isPseudoStat(),
+					breakpoints: cap.breakpoints.slice(),
+					postCapEps: cap.postCapEPs.slice(),
+				}),
+			);
+		}
+		// Hard stat caps: one breakpoint with 0 EP past it.
+		const hard = statCaps?.toProto();
+		(hard?.stats ?? []).forEach((v, i) => {
+			if (v > 0) gemCaps.push(GemStatCap.create({ unitStat: i, isPseudostat: false, breakpoints: [v], postCapEps: [0] }));
+		});
+		(hard?.pseudoStats ?? []).forEach((v, i) => {
+			if (v > 0) gemCaps.push(GemStatCap.create({ unitStat: i, isPseudostat: true, breakpoints: [v], postCapEps: [0] }));
+		});
 		return BulkSettings.create({
 			items: this.getItems(),
 			defaultRedGem: this.fallbackGems[0].id,
@@ -310,19 +367,54 @@ export class BulkTab extends SimTab {
 			defaultBlueGem: this.fallbackGems[2].id,
 			defaultMetaGem: this.fallbackGems[3].id,
 			defaultPrismaticGem: this.fallbackGems[4].id,
-			iterationsPerCombo: this.getDefaultIterationsCount(),
+			// Persist the raw user override (0 = "use the default", which tracks the global iteration
+			// count). Storing the resolved value would freeze the default and stop it tracking.
+			iterationsPerCombo: this.batchIterations,
 			freezeRingSlot: this.getFrozenItemSlot(BulkSimItemSlot.ItemSlotFinger),
 			freezeTrinketSlot: this.getFrozenItemSlot(BulkSimItemSlot.ItemSlotTrinket),
 			freezeWeaponSlot: this.frozenWeaponSlot,
 			freezeMainhandWeaponSlots: this.weaponTypeFilters.get(ItemSlot.ItemSlotMainHand)?.slice(),
 			freezeOffhandWeaponSlots: this.weaponTypeFilters.get(ItemSlot.ItemSlotOffHand)?.slice(),
+			optimizeGems: this.optimizeGems,
+			gemEpWeights: this.simUI.player.getEpWeights().toProto().stats,
+			gemCaps,
+			disableUniqueGems: this.simUI.reforger?.disableUniqueGemsSetting ?? false,
+			gemPoolIds: this.optimizeGems ? this.candidateGems().map(gem => gem.id) : [],
+			...this.metaConditionSettings(),
 		});
+	}
+
+	// The effective meta gem's color-activation condition, so the backend LP can keep the meta active
+	// (same source of truth as Suggest Gems: the configured fallback meta gem, else the equipped one).
+	private metaConditionSettings(): Partial<BulkSettings> {
+		let metaGemId = this.fallbackGems[3]?.id ?? 0;
+		if (!metaGemId) metaGemId = this.simUI.player.getGear().getMetaGem()?.id ?? 0;
+		if (!metaGemId) return {};
+		try {
+			const cond = getMetaGemCondition(metaGemId);
+			return {
+				metaMinRed: cond.minRed,
+				metaMinYellow: cond.minYellow,
+				metaMinBlue: cond.minBlue,
+				metaCompareColorGreater: cond.compareColorGreater,
+				metaCompareColorLesser: cond.compareColorLesser,
+			};
+		} catch {
+			return {}; // no known condition for this meta gem
+		}
 	}
 
 	private getDefaultIterationsCount(): number {
 		if (isExternal()) return WEB_DEFAULT_ITERATIONS;
 
-		return this.simUI.sim.getIterations();
+		// Batch is a ranking pass, so default below the full single-sim precision,
+		// but never above the user's configured iteration count.
+		return Math.min(this.simUI.sim.getIterations(), WEB_DEFAULT_ITERATIONS);
+	}
+
+	// Effective iterations to run for each combination.
+	protected getComboIterations(): number {
+		return this.batchIterations > 0 ? this.batchIterations : this.getDefaultIterationsCount();
 	}
 
 	protected createBulkItemsDatabase(): SimDatabase {
@@ -366,7 +458,42 @@ export class BulkTab extends SimTab {
 				itemsDb.gems.push(gem);
 			}
 		}
+		// Include the definitions for every enchant option so the backend can resolve them.
+		for (const [slot, ids] of this.enchantOptions.entries()) {
+			if (!ids.length) continue;
+			const available = this.simUI.sim.db.getEnchants(slot);
+			for (const id of ids) {
+				const enchant = available.find(e => e.effectId === id);
+				if (enchant) {
+					itemsDb.enchants.push(SimEnchant.fromJson(UIEnchant.toJson(enchant), { ignoreUnknownFields: true }));
+				}
+			}
+		}
+		// Ship the candidate gem pool so the optimizer can trade off (e.g. socket a hit gem to reach a
+		// cap, then agility), not just the equipped/fallback gems.
+		if (this.optimizeGems) {
+			for (const gem of this.candidateGems()) {
+				itemsDb.gems.push(SimGem.fromJson(UIGem.toJson(gem), { ignoreUnknownFields: true }));
+			}
+		}
 		return itemsDb;
+	}
+
+	// The gems the optimizer is allowed to use, filtered exactly like Suggest Gems' buildGemOptions:
+	// non-meta, within the configured max gem phase, and jewelcrafter-only gems only for a jeweler.
+	// Both the shipped gem database and the backend's gem_pool_ids derive from this single list so the
+	// optimizer can never reach for a gem the player couldn't actually use.
+	private candidateGems(): UIGem[] {
+		const maxPhase = this.simUI.reforger?.maxGemPhaseSetting ?? Number.MAX_SAFE_INTEGER;
+		const hasJC = this.simUI.player.hasProfession(Profession.Jewelcrafting);
+		return this.simUI.sim.db.getGems().filter(gem => {
+			if (gem.id <= 0) return false; // a 0-id "no gem" entry would leave sockets empty
+			if (gem.color === GemColor.GemColorMeta) return false;
+			if (gem.phase > maxPhase) return false;
+			if (gem.requiredProfession === Profession.Jewelcrafting && !hasJC) return false;
+			if (!gem.stats.some(stat => stat !== 0)) return false; // statless gems aren't worth socketing
+			return true;
+		});
 	}
 
 	// Add an item to its eligible bulk sim item slot(s). Mainly used for importing and search
@@ -678,11 +805,129 @@ export class BulkTab extends SimTab {
 				}
 			}
 
+			// Each slot with enchant options multiplies the space by its option count (whether that
+			// slot also varies items - item×enchant - or only varies the enchant on the equipped item).
+			for (const [slot, ids] of this.enchantOptions.entries()) {
+				if (ids.length) numCombinations *= this.enchantsToTry(slot).length;
+			}
+
 			this.combinations = numCombinations;
-			this.iterations = this.simUI.sim.getIterations() * numCombinations;
+			this.iterations = this.getComboIterations() * numCombinations;
 		} catch (e) {
 			this.simUI.handleCrash(e);
 		}
+	}
+
+	// Builds the combination space (per-slot option lists, weapon configs, ring/trinket pairs) as
+	// proto dimensions for the backend. Mirrors calculateBulkCombinations, so the product of the
+	// dimension sizes equals this.combinations. The backend expands the cartesian product and does
+	// the heavy work (gemming, simming, ranking); this is just the cheap option lists.
+	// enchantsToTry returns the enchants to try for a slot: the configured options resolved to
+	// Enchant objects, or [null] (keep the item's own enchant) when none are configured.
+	private enchantsToTry(slot: ItemSlot): (UIEnchant | null)[] {
+		const ids = this.enchantOptions.get(slot);
+		if (!ids || !ids.length) return [null];
+		const available = this.simUI.sim.db.getEnchants(slot);
+		const resolved = ids.map(id => available.find(e => e.effectId === id)).filter((e): e is UIEnchant => !!e);
+		return resolved.length ? resolved : [null];
+	}
+
+	private buildComboDimensions(): BulkComboDimension[] {
+		const dims: BulkComboDimension[] = [];
+		const coveredSlots = new Set<ItemSlot>(); // item slots that already have a dimension
+
+		// Weapon dimension (getAllWeaponCombos already includes the equipped weapons), cross-producted
+		// with the main-hand and off-hand enchant options.
+		const weaponCombos = this.getAllWeaponCombos();
+		const mhEnchants = this.enchantsToTry(ItemSlot.ItemSlotMainHand);
+		const ohEnchants = this.enchantsToTry(ItemSlot.ItemSlotOffHand);
+		const weaponChoices: BulkComboChoice[] = [];
+		for (const [mh, oh] of weaponCombos) {
+			for (const mhEnchant of mhEnchants) {
+				for (const ohEnchant of ohEnchants) {
+					const items: BulkComboSlotItem[] = [];
+					if (mh) items.push(BulkComboSlotItem.create({ slot: ItemSlot.ItemSlotMainHand, item: mhEnchant ? mh.withEnchant(mhEnchant).asSpec() : mh.asSpec() }));
+					if (oh) items.push(BulkComboSlotItem.create({ slot: ItemSlot.ItemSlotOffHand, item: ohEnchant ? oh.withEnchant(ohEnchant).asSpec() : oh.asSpec() }));
+					weaponChoices.push(BulkComboChoice.create({ items }));
+				}
+			}
+		}
+		dims.push(BulkComboDimension.create({ choices: weaponChoices }));
+		coveredSlots.add(ItemSlot.ItemSlotMainHand);
+		coveredSlots.add(ItemSlot.ItemSlotOffHand);
+
+		for (const [bulkItemSlot, pickerGroup] of this.pickerGroups.entries()) {
+			if (
+				pickerGroup.pickers.size == 0 ||
+				[BulkSimItemSlot.ItemSlotMainHand, BulkSimItemSlot.ItemSlotOffHand, BulkSimItemSlot.ItemSlotHandWeapon].includes(bulkItemSlot)
+			) {
+				continue;
+			}
+
+			const options = Array.from(pickerGroup.pickers.values()).map(picker => picker.item);
+			const numOptions = options.length;
+
+			if (numOptions > 1 && [BulkSimItemSlot.ItemSlotFinger, BulkSimItemSlot.ItemSlotTrinket].includes(bulkItemSlot)) {
+				let pairs = getAllPairs(options);
+				const frozenItem = this.frozenItems.get(bulkItemSlot);
+				if (frozenItem) {
+					pairs = options.filter(option => !frozenItem.equals(option)).map(option => [frozenItem, option] as [EquippedItem, EquippedItem]);
+				}
+				const slots = bulkSimItemSlotToItemSlotPairs.get(bulkItemSlot)!;
+				coveredSlots.add(slots[0]);
+				coveredSlots.add(slots[1]);
+				const e0 = this.enchantsToTry(slots[0]);
+				const e1 = this.enchantsToTry(slots[1]);
+				const pairChoices: BulkComboChoice[] = [];
+				for (const [a, b] of pairs) {
+					for (const en0 of e0) {
+						for (const en1 of e1) {
+							pairChoices.push(
+								BulkComboChoice.create({
+									items: [
+										BulkComboSlotItem.create({ slot: slots[0], item: en0 ? a.withEnchant(en0).asSpec() : a.asSpec() }),
+										BulkComboSlotItem.create({ slot: slots[1], item: en1 ? b.withEnchant(en1).asSpec() : b.asSpec() }),
+									],
+								}),
+							);
+						}
+					}
+				}
+				dims.push(BulkComboDimension.create({ choices: pairChoices }));
+			} else {
+				const slot = bulkSimItemSlotToSingleItemSlot.get(bulkItemSlot) ?? bulkSimItemSlotToItemSlotPairs.get(bulkItemSlot)![0];
+				coveredSlots.add(slot);
+				// Cross-product the item options with the enchant options for this slot.
+				const enchants = this.enchantsToTry(slot);
+				const choices: BulkComboChoice[] = [];
+				for (const option of options) {
+					for (const enchant of enchants) {
+						const spec = enchant ? option.withEnchant(enchant).asSpec() : option.asSpec();
+						choices.push(BulkComboChoice.create({ items: [BulkComboSlotItem.create({ slot, item: spec })] }));
+					}
+				}
+				dims.push(BulkComboDimension.create({ choices }));
+			}
+		}
+
+		// Slots with enchant options but no item dimension: vary just the enchant on the equipped item.
+		for (const [slot, ids] of this.enchantOptions.entries()) {
+			if (!ids.length || coveredSlots.has(slot)) continue;
+			const item = this.simUI.player.getGear().getEquippedItem(slot);
+			if (!item) continue;
+			const enchants = this.enchantsToTry(slot);
+			dims.push(
+				BulkComboDimension.create({
+					choices: enchants.map(enchant =>
+						BulkComboChoice.create({
+							items: [BulkComboSlotItem.create({ slot, item: enchant ? item.withEnchant(enchant).asSpec() : item.asSpec() })],
+						}),
+					),
+				}),
+			);
+		}
+
+		return dims;
 	}
 
 	protected buildTabContent() {
@@ -1081,11 +1326,96 @@ export class BulkTab extends SimTab {
 				gemContainerRef.value?.addEventListener('click', openGemSelector);
 			},
 		);
+
+		// Sit the iterations input right under the Simulate button (they belong together, like the
+		// global iterations input) instead of buried below the gem/enchant settings.
+		const iterationsContainer = document.createElement('div');
+		this.bulkSimButton.insertAdjacentElement('afterend', iterationsContainer);
+		new NumberPicker<BulkTab>(iterationsContainer, this, {
+			id: 'bulk-iterations-per-combo',
+			label: 'Iterations per combo',
+			labelTooltip:
+				'How many iterations to sim each gear combination at. Total work is this number times the number of combinations, so lowering it speeds up the whole batch proportionally. Use a low value (e.g. 1000) for a quick ranking pass, then re-sim the top results at full iterations.',
+			inline: true,
+			changedEvent: _modObj => this.settingsChangedEmitter,
+			getValue: _modObj => this.getComboIterations(),
+			setValue: (eventID, _modObj, newValue: number) => {
+				this.batchIterations = Math.max(1, Math.floor(newValue));
+				this.settingsChangedEmitter.emit(eventID);
+			},
+		});
+
+		const optimizeGemsContainer = document.createElement('div');
+		this.settingsContainer.appendChild(optimizeGemsContainer);
+		new BooleanPicker<BulkTab>(optimizeGemsContainer, this, {
+			id: 'bulk-optimize-gems',
+			label: 'Optimize gems',
+			labelTooltip:
+				'Re-gems each combination optimally — socket bonuses, meta-gem requirements and stat caps — using the same engine as Suggest Gems, instead of just filling every socket with your fallback gems. Much more accurate, but adds time per combination (a stat calc + solve each). Turn off for a fast crude fill.',
+			inline: true,
+			changedEvent: _modObj => this.settingsChangedEmitter,
+			getValue: _modObj => this.optimizeGems,
+			setValue: (eventID, _modObj, newValue: boolean) => {
+				this.optimizeGems = newValue;
+				this.settingsChangedEmitter.emit(eventID);
+			},
+		});
+
+		// Enchant options: pick enchants to try per slot. Each selected enchant becomes extra
+		// combinations (the slot's item(s) crossed with the chosen enchants). Phase 1 covers the
+		// single-item armor slots; weapons/rings/trinkets are not yet supported.
+		const enchantsContainer = document.createElement('div');
+		enchantsContainer.classList.add('bulk-settings-enchants', 'mt-2');
+		const enchantsHeading = document.createElement('label');
+		enchantsHeading.classList.add('form-label');
+		enchantsHeading.textContent = 'Enchant options to try (Ctrl/Cmd-click to pick several per slot)';
+		enchantsContainer.appendChild(enchantsHeading);
+		this.settingsContainer.appendChild(enchantsContainer);
+		// Populate the per-slot enchant selects once the item database has loaded (it's async, so
+		// this.simUI.sim.db is null while the tab is first built).
+		this.simUI.sim.waitForInit().then(() => {
+			const enchantableSlots = new Set<ItemSlot>([
+				...bulkSimItemSlotToSingleItemSlot.values(),
+				...Array.from(bulkSimItemSlotToItemSlotPairs.values()).flat(),
+			]);
+			for (const slot of enchantableSlots) {
+				const enchants = this.simUI.sim.db.getEnchants(slot);
+				if (!enchants.length) continue;
+				const row = document.createElement('div');
+				row.classList.add('d-flex', 'align-items-center', 'gap-2', 'mb-1');
+				const label = document.createElement('span');
+				label.style.minWidth = '5rem';
+				label.textContent = ItemSlot[slot].replace('ItemSlot', '');
+				const select = document.createElement('select');
+				select.multiple = true;
+				select.classList.add('form-select', 'form-select-sm');
+				for (const enchant of enchants) {
+					const opt = document.createElement('option');
+					opt.value = String(enchant.effectId);
+					opt.textContent = enchant.name;
+					select.appendChild(opt);
+				}
+				select.addEventListener('change', () => {
+					const ids = Array.from(select.selectedOptions).map(o => Number(o.value));
+					if (ids.length) this.enchantOptions.set(slot, ids);
+					else this.enchantOptions.delete(slot);
+					this.settingsChangedEmitter.emit(TypedEvent.nextEventID());
+				});
+				row.appendChild(label);
+				row.appendChild(select);
+				enchantsContainer.appendChild(row);
+			}
+		});
 	}
 
 	private getCombinationsCount(): Element {
 		this.calculateBulkCombinations();
 		this.bulkSimButton.disabled = !this.combinations || this.combinations > this.getCombinationsLimit();
+
+		// Big counts are hard to read, so group with thousand separators and tack on a compact
+		// abbreviation (10K / 1.2M / 3B / 1T). The abbreviation is dropped below 10,000, where it adds nothing.
+		const grouped = (n: number) => formatToNumber(n, { maximumFractionDigits: 0 });
+		const compact = (n: number) => (n >= 10000 ? ` (${formatToCompactNumber(n, { maximumFractionDigits: 1 })})` : '');
 
 		const warningRef = ref<HTMLButtonElement>();
 		const rtn = (
@@ -1093,10 +1423,11 @@ export class BulkTab extends SimTab {
 				<span className={clsx(this.showIterationsWarning() && 'text-danger')}>
 					{this.combinations === 1
 						? i18n.t('bulk_tab.settings.combination_singular')
-						: i18n.t('bulk_tab.settings.combinations_count', { count: this.combinations })}
+						: `${i18n.t('bulk_tab.settings.combinations_count', { value: grouped(this.combinations) })}${compact(this.combinations)}`}
 					<br />
 					<small>
-						{this.iterations} {i18n.t('bulk_tab.settings.iterations')}
+						{grouped(this.iterations)} {i18n.t('bulk_tab.settings.iterations')}
+						{compact(this.iterations)}
 					</small>
 				</span>
 				{this.showIterationsWarning() && (
@@ -1142,7 +1473,7 @@ export class BulkTab extends SimTab {
 	private setReforgeProgress(currentRound: number, rounds: number) {
 		this.progressTrackerModal.updateProgress({
 			stage: 'reforging',
-			title: i18n.t('bulk_tab.progress.reforging_rounds'),
+			title: 'Optimizing gems',
 			current: currentRound - 1,
 			total: rounds,
 			message: undefined,
@@ -1172,7 +1503,7 @@ export class BulkTab extends SimTab {
 							total: progress.totalIterations,
 						})}
 					/>
-					<div>{i18n.t('bulk_tab.progress.seconds_remaining', { seconds: Math.round(secondsRemaining) })}</div>
+					<div>{i18n.t('bulk_tab.progress.seconds_remaining', { time: formatDuration(secondsRemaining) })}</div>
 				</div>
 			),
 		});
@@ -1199,7 +1530,6 @@ export class BulkTab extends SimTab {
 		this.topGearResults = null;
 		this.originalGearResults = null;
 
-		const candidateGearSets: Gear[] = [];
 		const reforgedGearSets: Gear[] = [];
 
 		try {
@@ -1211,10 +1541,74 @@ export class BulkTab extends SimTab {
 			this.resetResultsTabContent();
 			this.calculateBulkCombinations();
 
-			const allItemCombos: Map<ItemSlot, EquippedItem>[] = [];
+			// [foundation step 2 validation] Confirm the combo-space dimensions we'll hand the
+			// backend reproduce the exact combination count the browser computes. No backend call
+			// yet - this just proves the dimension-building is faithful before we wire the runner.
+			try {
+				const comboDimensions = this.buildComboDimensions();
+				const dimensionsProduct = comboDimensions.reduce((product, dim) => product * dim.choices.length, 1);
+				console.log(
+					`[bulk] combo dimensions: ${comboDimensions.length} dims, product = ${dimensionsProduct}, ` +
+						`browser combinations = ${this.combinations}, match = ${dimensionsProduct === this.combinations}`,
+				);
+			} catch (e) {
+				console.error('[bulk] buildComboDimensions failed:', e);
+			}
 
-			for (let comboIdx = 0; comboIdx < this.combinations; comboIdx++) {
-				allItemCombos.push(this.getItemsForCombo(comboIdx));
+			const originalGear = this.originalGear!;
+
+			// Native path: hand the whole batch to the Go backend - it expands the combinations,
+			// sims them across all cores, and returns the ranked results. The browser does no
+			// per-combo work. (Wasm has no native runner, so it falls through to the per-combo path
+			// below. Gemming is still crude here; the cap-aware optimizer port is the next phase.)
+			if (!(await this.simUI.sim.isWasm())) {
+				const iterations = this.getComboIterations();
+				const base = this.simUI.sim.buildGearSimRequest(originalGear, iterations);
+
+				// The combos reference the bulk items, so the base request's database must contain
+				// them (the backend resolves item stats from it).
+				const baseDb = base.raid!.parties[0].players[0].database!;
+				const bulkDb = this.createBulkItemsDatabase();
+				baseDb.items.push(...bulkDb.items);
+				baseDb.enchants.push(...bulkDb.enchants);
+				baseDb.gems.push(...bulkDb.gems);
+				baseDb.randomSuffixes.push(...bulkDb.randomSuffixes);
+				baseDb.itemEffectRandPropPoints.push(...bulkDb.itemEffectRandPropPoints);
+
+				const request = BulkComboSimRequest.create({
+					base,
+					dimensions: this.buildComboDimensions(),
+					settings: this.createBulkSettings(),
+				});
+
+				this.setBatchSimProgress(0, this.combinations);
+				const comboResult = await this.runWithBulkAbort(
+					this.simUI.sim.runBulkComboSim(request, (progress: ProgressMetrics) =>
+						this.setBatchSimProgress(progress.completedSims, progress.totalSims || this.combinations),
+					),
+					abortSignal,
+				);
+
+				// [validation] surface the numbers so they can be checked against a manual single-sim.
+				console.log(
+					`[bulk] native runner: ${comboResult.totalCombinations} combos, baseline dps = ${comboResult.baseline?.dps?.avg?.toFixed(1)}, ` +
+						`top = [${comboResult.ranked.map(r => (r.dps?.avg ?? 0).toFixed(1)).join(', ')}]`,
+				);
+
+				this.topGearResults = comboResult.ranked.map(r => ({
+					gear: this.simUI.sim.db.lookupEquipmentSpec(r.equipment!),
+					dpsMetrics: r.dps!,
+				}));
+				if (comboResult.baseline) {
+					this.originalGearResults = {
+						gear: this.simUI.sim.db.lookupEquipmentSpec(comboResult.baseline.equipment!),
+						dpsMetrics: comboResult.baseline.dps!,
+					};
+					this.topGearResults.push(this.originalGearResults);
+				}
+				this.topGearResults.sort((a, b) => b.dpsMetrics.avg - a.dpsMetrics.avg);
+				this.buildResultsTabContent();
+				return;
 			}
 
 			const defaultGemsByColor = new Map<GemColor, UIGem | null>();
@@ -1229,13 +1623,14 @@ export class BulkTab extends SimTab {
 				defaultGemsByColor.set(color, this.simUI.sim.db.lookupGem(this.fallbackGems[colorIdx].id));
 			}
 
-			for (let comboIdx = 0; comboIdx < this.combinations; comboIdx++) {
-				this.throwIfBulkAborted(abortSignal);
+			// Build a single combination's gear set on demand. The old code materialized
+			// every combination (item maps + candidate gear sets + reforged gear sets) up
+			// front, which is what made the tab run out of memory and crash on large batches.
+			const buildCandidateGear = (comboIdx: number): Gear => {
+				let reforgeGear = originalGear;
 
-				let reforgeGear = this.originalGear;
-
-				for (const [itemSlot, equippedItem] of allItemCombos[comboIdx].entries()) {
-					const equippedItemInSlot = this.originalGear.getEquippedItem(itemSlot);
+				for (const [itemSlot, equippedItem] of this.getItemsForCombo(comboIdx).entries()) {
+					const equippedItemInSlot = originalGear.getEquippedItem(itemSlot);
 					let updatedItem = equippedItemInSlot ? equippedItemInSlot.withItem(equippedItem.item) : equippedItem;
 
 					if (equippedItem._randomSuffix) {
@@ -1251,56 +1646,91 @@ export class BulkTab extends SimTab {
 					}
 				}
 
-				candidateGearSets.push(reforgeGear);
-			}
+				return reforgeGear;
+			};
 
-			let completedReforges = 1;
-			this.setReforgeProgress(completedReforges, candidateGearSets.length);
-			await sleep(400);
-			const reforgeTasks = candidateGearSets.map(reforgeGear => async () => {
-				const reforgedGear = await this.optimizeReforges(reforgeGear, abortSignal);
-				this.throwIfBulkAborted(abortSignal);
-				completedReforges += 1;
-				this.setReforgeProgress(completedReforges, candidateGearSets.length);
-				return reforgedGear;
-			});
-			const reforgeSettledResults = await promisePool(reforgeTasks, {
-				concurrency,
-			});
-			const rejectedReforge = reforgeSettledResults.find(result => result.status === 'rejected');
-			if (rejectedReforge && rejectedReforge.status === 'rejected') {
-				throw rejectedReforge.reason;
-			}
-			const reforgeResults = reforgeSettledResults
-				.filter((result): result is PromiseFulfilledResult<Gear | null> => result.status === 'fulfilled')
-				.map(result => result.value);
+			if (this.optimizeGems && this.simUI.reforger) {
+				let completedReforges = 1;
+				this.setReforgeProgress(completedReforges, this.combinations);
+				await sleep(400);
+				const reforgeTasks = Array.from({ length: this.combinations }, (_, comboIdx) => async () => {
+					this.throwIfBulkAborted(abortSignal);
+					const reforgedGear = await this.optimizeReforges(buildCandidateGear(comboIdx), abortSignal);
+					this.throwIfBulkAborted(abortSignal);
+					completedReforges += 1;
+					this.setReforgeProgress(completedReforges, this.combinations);
+					return reforgedGear;
+				});
+				const reforgeSettledResults = await runWithConcurrency(reforgeTasks, concurrency);
+				const rejectedReforge = reforgeSettledResults.find(result => result.status === 'rejected');
+				if (rejectedReforge && rejectedReforge.status === 'rejected') {
+					throw rejectedReforge.reason;
+				}
+				const reforgeResults = reforgeSettledResults
+					.filter((result): result is PromiseFulfilledResult<Gear | null> => result.status === 'fulfilled')
+					.map(result => result.value);
 
-			reforgedGearSets.push(...reforgeResults.filter((gear): gear is Gear => !!gear));
+				reforgedGearSets.push(...reforgeResults.filter((gear): gear is Gear => !!gear));
+			}
+			// When gem optimization is off, reforgedGearSets stays empty and each combo's gear is
+			// built lazily per chunk below, so we never materialize every combination up front.
 
 			this.simStart = new Date().getTime();
-			const totalSimRounds = reforgedGearSets.length + 1;
-			const result = await this.runWithBulkAbort(this.runSingleGearSim(this.originalGear, 1, totalSimRounds), abortSignal);
-			const referenceDpsMetrics = result!.raidMetrics!.dps!;
+			const iterations = this.getComboIterations();
+			const haveOptimizedGear = this.optimizeGems && !!this.simUI.reforger;
+			const comboCount = haveOptimizedGear ? reforgedGearSets.length : this.combinations;
+			const getGear = (i: number): Gear => (haveOptimizedGear ? reforgedGearSets[i] : buildCandidateGear(i));
 
-			for (let comboIdx = 0; comboIdx < reforgedGearSets.length; comboIdx++) {
+			this.setBatchSimProgress(0, comboCount);
+
+			// Baseline (current gear) on its own, for the reference DPS.
+			const baseResults = await this.runWithBulkAbort(
+				this.simUI.sim.runBulkSim([this.simUI.sim.buildGearSimRequest(originalGear, iterations)], () => {}),
+				abortSignal,
+			);
+			const referenceDpsMetrics = baseResults[0]!.raidMetrics!.dps!;
+
+			// Sim the combinations in chunks. Each chunk is one bulk request the server runs across
+			// all cores; chunking keeps memory bounded (only one chunk's requests + results exist at a
+			// time) and the UI responsive (we yield between chunks). Running everything in a single
+			// request previously ballooned to tens of GB and produced a result too large to send back.
+			const CHUNK_SIZE = 200;
+			let completed = 0;
+			for (let start = 0; start < comboCount; start += CHUNK_SIZE) {
 				this.throwIfBulkAborted(abortSignal);
 
-				const reforgedGear = reforgedGearSets[comboIdx];
-				const result = await this.runWithBulkAbort(this.runSingleGearSim(reforgedGear, comboIdx + 2, totalSimRounds), abortSignal);
-
-				const isOriginalGear = this.originalGear.equals(reforgedGear);
-				if (!isOriginalGear) {
-					const dpsMetrics = result!.raidMetrics!.dps!;
-					dpsMetrics.hist = [];
-					dpsMetrics.allValues = [];
-					topGearResults.push({
-						gear: reforgedGear,
-						dpsMetrics,
-					});
+				const end = Math.min(start + CHUNK_SIZE, comboCount);
+				const chunkGears: Gear[] = [];
+				const requests: RaidSimRequest[] = [];
+				for (let i = start; i < end; i++) {
+					const gear = getGear(i);
+					chunkGears.push(gear);
+					requests.push(this.simUI.sim.buildGearSimRequest(gear, iterations));
 				}
 
-				topGearResults.sort((a, b) => b.dpsMetrics.avg - a.dpsMetrics.avg);
-				if (topGearResults.length > 5) topGearResults.pop();
+				const chunkResults = await this.runWithBulkAbort(
+					this.simUI.sim.runBulkSim(requests, (progress: ProgressMetrics) => this.setBatchSimProgress(completed + progress.completedSims, comboCount)),
+					abortSignal,
+				);
+
+				for (let i = 0; i < chunkGears.length; i++) {
+					const reforgedGear = chunkGears[i];
+					const result = chunkResults[i];
+					if (!result || result.error || originalGear.equals(reforgedGear)) {
+						continue;
+					}
+
+					const dpsMetrics = result.raidMetrics!.dps!;
+					dpsMetrics.hist = [];
+					dpsMetrics.allValues = [];
+					topGearResults.push({ gear: reforgedGear, dpsMetrics });
+					topGearResults.sort((a, b) => b.dpsMetrics.avg - a.dpsMetrics.avg);
+					if (topGearResults.length > 5) topGearResults.pop();
+				}
+
+				completed += chunkGears.length;
+				this.setBatchSimProgress(completed, comboCount);
+				await sleep(0); // yield so the UI stays responsive between chunks
 			}
 
 			this.topGearResults = topGearResults;
@@ -1336,10 +1766,31 @@ export class BulkTab extends SimTab {
 		}
 	}
 
-	private async runSingleGearSim(gear: Gear, currentRound: number, totalRounds: number): Promise<RaidSimResult> {
-		const response = await this.simUI.runSimLightweight(gear, (progressMetrics: ProgressMetrics) => {
-			this.setSimProgress(progressMetrics, currentRound, totalRounds);
+	// Progress for the concurrent batch run, driven by how many combinations have finished
+	// (per-iteration progress is meaningless when several sims run at once).
+	private setBatchSimProgress(completed: number, total: number) {
+		const totalElapsedSeconds = (new Date().getTime() - this.simStart) / 1000;
+		const secondsRemaining = completed > 0 ? (totalElapsedSeconds / completed) * (total - completed) : 0;
+
+		this.progressTrackerModal.updateProgress({
+			stage: 'sim',
+			title: i18n.t('bulk_tab.progress.refining_rounds'),
+			current: completed,
+			total: total,
+			message: (
+				<div className="results-sim">
+					<div>{`${completed} / ${total} combinations simulated`}</div>
+					<div>{i18n.t('bulk_tab.progress.seconds_remaining', { time: formatDuration(secondsRemaining) })}</div>
+				</div>
+			),
 		});
+	}
+
+	private async runSingleGearSim(gear: Gear): Promise<RaidSimResult> {
+		// Call sim.runRaidSimLightweight directly instead of simUI.runSimLightweight: the latter
+		// aborts ALL running sims on entry, which would make concurrent batch sims kill each other.
+		// The batch already does a single abortType(All) at the start to clear any prior runs.
+		const response = await this.simUI.sim.runRaidSimLightweight(gear, () => {}, { iterations: this.getComboIterations() });
 		if (!response || (response && 'type' in response)) {
 			throw new Error(response?.message);
 		}

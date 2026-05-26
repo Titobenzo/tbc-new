@@ -371,6 +371,18 @@ export const formatToNumber = (number: number, options?: Intl.NumberFormatOption
 	return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2, ...options }).format(number);
 };
 
+// Formats a duration in seconds as "Xh Ym Zs", dropping leading zero units (e.g. "45s", "1m 23s",
+// "95h 55m 45s"). Used for elapsed/remaining time so big numbers stay readable.
+export const formatDuration = (totalSeconds: number): string => {
+	const s = Math.max(0, Math.floor(totalSeconds));
+	const hours = Math.floor(s / 3600);
+	const minutes = Math.floor((s % 3600) / 60);
+	const seconds = s % 60;
+	if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+	if (minutes > 0) return `${minutes}m ${seconds}s`;
+	return `${seconds}s`;
+};
+
 type Environments = 'local' | 'external';
 
 const hostname = window.location.hostname;
@@ -475,4 +487,29 @@ export const promisePool = <T>(
 
 		return results;
 	})();
+};
+
+// Like promisePool, but streams: keeps up to `concurrency` tasks in flight and starts a new one
+// the instant any task finishes, instead of running fixed batches and waiting for the slowest in
+// each batch. This keeps all workers continuously busy when task durations vary (e.g. LP solves).
+// Results are returned in task order.
+export const runWithConcurrency = async <T>(tasks: Array<() => Promise<T>>, concurrency: number): Promise<PromiseSettledResult<T>[]> => {
+	const results: PromiseSettledResult<T>[] = new Array(tasks.length);
+	let nextIndex = 0;
+
+	const runWorker = async () => {
+		while (true) {
+			const i = nextIndex++;
+			if (i >= tasks.length) return;
+			try {
+				results[i] = { status: 'fulfilled', value: await tasks[i]() };
+			} catch (reason) {
+				results[i] = { status: 'rejected', reason };
+			}
+		}
+	};
+
+	const workerCount = Math.max(1, Math.min(concurrency, tasks.length));
+	await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+	return results;
 };

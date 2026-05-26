@@ -3,6 +3,7 @@ import { BaseModal } from './base_modal.js';
 import { Component } from './component.js';
 import { ref } from 'tsx-vanilla';
 import i18n from '../../i18n/config.js';
+import { formatDuration } from '../utils.js';
 
 export interface ProgressTrackerModalState {
 	stage: 'initializing' | 'complete' | 'error' | string;
@@ -180,13 +181,7 @@ export class ProgressTrackerModal extends Component {
 
 		const elapsed = (Date.now() - this.startTime) / 1000;
 
-		// Format time nicely
-		if (elapsed < 60) {
-			this.elapsedTimeElement.textContent = `${elapsed.toFixed(1)}s`;
-		} else {
-			const minutes = Math.floor(elapsed / 60);
-			const seconds = Math.floor(elapsed % 60);
-			this.elapsedTimeElement.textContent = `${minutes}m ${seconds}s`;
-		}
+		// Format time nicely: sub-minute keeps a decimal second; longer rolls up into "Xh Ym Zs".
+		this.elapsedTimeElement.textContent = elapsed < 60 ? `${elapsed.toFixed(1)}s` : formatDuration(elapsed);
 	}
 }

@@ -5,10 +5,14 @@ import { CURRENT_PHASE, LOCAL_STORAGE_PREFIX } from './constants/other';
 import { Encounter } from './encounter';
 import { Player, UnitMetadata } from './player';
 import {
+	BulkComboSimRequest,
+	BulkComboSimResult,
+	BulkSimRequest,
 	ComputeStatsRequest,
 	ErrorOutcome,
 	ErrorOutcomeType,
 	PlayerStats,
+	ProgressMetrics,
 	Raid as RaidProto,
 	RaidSimRequest,
 	RaidSimResult,
@@ -57,6 +61,7 @@ interface SimProps {
 
 export type RunSimOptions = {
 	silent?: boolean; // If true, don't emit the simResultEmitter event.
+	iterations?: number; // If set (>0), overrides the configured iteration count for this run (used by batch/bulk runs).
 };
 
 const WASM_CONCURRENCY_STORAGE_KEY = `${LOCAL_STORAGE_PREFIX}_wasmconcurrency`;
@@ -306,7 +311,7 @@ export class Sim {
 	async runRaidSimLightweight(
 		gear: Gear,
 		onProgress: WorkerProgressCallback,
-		_: RunSimOptions = {},
+		options: RunSimOptions = {},
 	): Promise<[RaidSimRequest, RaidSimResult] | ErrorOutcome> {
 		if (this.raid.isEmpty()) {
 			throw new Error('Raid is empty! Try adding some players first.');
@@ -319,6 +324,10 @@ export class Sim {
 			await this.waitForInit();
 
 			const request = this.makeRaidSimRequest(false);
+			// Allow callers (e.g. batch runs) to sim at a reduced iteration count.
+			if (options.iterations && options.iterations > 0) {
+				request.simOptions!.iterations = options.iterations;
+			}
 			const player = request.raid!.parties[0].players[0];
 
 			// Remove any inactive meta gems, since the backend doesn't have its own validation.
@@ -350,6 +359,65 @@ export class Sim {
 			if (error instanceof SimError) throw error;
 			console.error(error);
 			throw new Error('Something went wrong running your lightweight raid sim. Reload the page and try again.');
+		} finally {
+			this.signalManager.unregisterRunning(signals);
+		}
+	}
+
+	// Builds a RaidSimRequest for player 0 wearing the given gear, at the given iteration count.
+	// Mirrors the per-gear setup in runRaidSimLightweight so a batch can build many requests up front.
+	buildGearSimRequest(gear: Gear, iterations: number): RaidSimRequest {
+		const request = this.makeRaidSimRequest(false);
+		if (iterations > 0) {
+			request.simOptions!.iterations = iterations;
+		}
+		const player = request.raid!.parties[0].players[0];
+
+		// Remove any inactive meta gems, since the backend doesn't validate them.
+		if (gear.hasInactiveMetaGem()) {
+			gear = gear.withoutMetaGem();
+		}
+		player.database = gear.toDatabase(this.db);
+		player.equipment = gear.asSpec();
+		request.raid!.parties[0].players[0] = player;
+
+		return request;
+	}
+
+	// Runs many gear-combination sims as one batch, returning results in the same order as
+	// `requests`. On the native server this is a single bulk request the server runs across all
+	// cores (one whole combo per core); on wasm (single-threaded) it falls back to running each
+	// combo sequentially in-process.
+	async runBulkSim(requests: RaidSimRequest[], onProgress: WorkerProgressCallback): Promise<RaidSimResult[]> {
+		const signals = this.signalManager.registerRunning(RequestTypes.RaidSim);
+		try {
+			await this.waitForInit();
+
+			if (await this.isWasm()) {
+				const results: RaidSimResult[] = [];
+				for (let i = 0; i < requests.length; i++) {
+					if (signals.abort.isTriggered()) break;
+					results.push(await this.workerPool.raidSimAsync(requests[i], noop, signals));
+					onProgress(ProgressMetrics.create({ completedSims: i + 1, totalSims: requests.length }));
+				}
+				return results;
+			}
+
+			const result = await this.workerPool.bulkSimAsync(BulkSimRequest.create({ requests }), onProgress, signals);
+			return result.results;
+		} finally {
+			this.signalManager.unregisterRunning(signals);
+		}
+	}
+
+	// Runs a full server-side bulk gear comparison: the backend expands the combination space,
+	// sims every combination across all cores, and returns the ranked results. Native only - the
+	// wasm worker has no concurrent runner (the batch tab keeps its per-combo path for wasm).
+	async runBulkComboSim(request: BulkComboSimRequest, onProgress: WorkerProgressCallback): Promise<BulkComboSimResult> {
+		const signals = this.signalManager.registerRunning(RequestTypes.RaidSim);
+		try {
+			await this.waitForInit();
+			return await this.workerPool.bulkComboSimAsync(request, onProgress, signals);
 		} finally {
 			this.signalManager.unregisterRunning(signals);
 		}

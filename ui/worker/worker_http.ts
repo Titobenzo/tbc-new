@@ -1,4 +1,4 @@
-import { noop, sleep } from './utils';
+import { noop } from './utils';
 import { HandlerFunction, WorkerInterface } from './worker_interface';
 
 const defaultRequestOptions = {
@@ -35,7 +35,8 @@ export const setupHttpWorker = (baseURL: string) => {
 			const ab = await progressResponse.arrayBuffer();
 			outputData = new Uint8Array(ab);
 			progress(outputData);
-			await sleep(500);
+			// No client-side wait: the server long-polls /asyncProgress, holding each request open
+			// until there is new progress or completion. The next request paces itself naturally.
 		}
 		return outputData;
 	};
@@ -52,6 +53,8 @@ export const setupHttpWorker = (baseURL: string) => {
 		raidSim: syncHandler,
 		raidSimJson: syncHandler,
 		raidSimAsync: asyncHandler,
+		bulkSimAsync: asyncHandler,
+		bulkComboSimAsync: asyncHandler,
 		statWeights: syncHandler,
 		statWeightsAsync: asyncHandler,
 		statWeightRequests: syncHandler,

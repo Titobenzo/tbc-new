@@ -879,7 +879,7 @@
 			"item_unique": "{{itemName}} is unique and already added."
 		},
 		"settings": {
-			"combinations_count": "{{count}} Combinations",
+			"combinations_count": "{{value}} Combinations",
 			"combination_singular": "1 Combination",
 			"iterations": "Iterations",
 			"fallback_gems": "Fallback Gems",
@@ -911,7 +911,7 @@
 			"baseline_round": "Running baseline round",
 			"refining_rounds": "Running refining rounds",
 			"iterations_complete": "{{completed}} / {{total}}<br />iterations complete",
-			"seconds_remaining": "{{seconds}} seconds remaining"
+			"seconds_remaining": "{{time}} remaining"
 		},
 		"notifications": {
 			"bulk_sim_cancelled": "Bulk sim cancelled.",

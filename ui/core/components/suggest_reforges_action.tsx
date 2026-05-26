@@ -336,6 +336,16 @@ export class ReforgeOptimizer {
 		return this.updateSoftCaps?.(StatCap.cloneSoftCaps(this._softCapsConfig)) || this._softCapsConfig;
 	}
 
+	// Whether the optimizer should exclude unique-equipped gems (read by the bulk tab).
+	get disableUniqueGemsSetting(): boolean {
+		return this.disableUniqueGems;
+	}
+
+	// Max gem phase as a plain number (read by the bulk tab to filter the candidate gem pool).
+	get maxGemPhaseSetting(): number {
+		return this.maxGemPhase; // Phase is a numeric enum (Phase1 = 1), so this is the phase number
+	}
+
 	get softCapsConfigWithLimits() {
 		if (!this.enableBreakpointLimits || !this.useSoftCapBreakpoints) return this.softCapsConfig;
 

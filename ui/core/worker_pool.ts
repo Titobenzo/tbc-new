@@ -3,6 +3,10 @@ import { REPO_NAME } from './constants/other.js';
 import {
 	AbortRequest,
 	AbortResponse,
+	BulkComboSimRequest,
+	BulkComboSimResult,
+	BulkSimRequest,
+	BulkSimResult,
 	ComputeStatsRequest,
 	ComputeStatsResult,
 	ProgressMetrics,
@@ -116,6 +120,34 @@ export class WorkerPool {
 		return result.finalRaidResult!;
 	}
 
+	async bulkSimAsync(request: BulkSimRequest, onProgress: WorkerProgressCallback, signals: SimSignals): Promise<BulkSimResult> {
+		const worker = this.getLeastBusyWorker();
+		const id = generateRequestId(SimRequest.bulkSimAsync);
+
+		signals.abort.onTrigger(async () => {
+			await worker.sendAbortById(id);
+		});
+
+		// Use the combined iteration count across all combos for the worker's work tracking.
+		const totalIterations = request.requests.reduce((sum, r) => sum + (r.simOptions?.iterations ?? 0), 0) || request.requests.length;
+		const result = await this.doAsyncRequest(SimRequest.bulkSimAsync, BulkSimRequest.toBinary(request), id, worker, onProgress, totalIterations);
+		return result.finalBulkResult!;
+	}
+
+	async bulkComboSimAsync(request: BulkComboSimRequest, onProgress: WorkerProgressCallback, signals: SimSignals): Promise<BulkComboSimResult> {
+		const worker = this.getLeastBusyWorker();
+		const id = generateRequestId(SimRequest.bulkComboSimAsync);
+
+		signals.abort.onTrigger(async () => {
+			await worker.sendAbortById(id);
+		});
+
+		const comboCount = request.dimensions.reduce((product, dim) => product * dim.choices.length, 1);
+		const totalIterations = (request.settings?.iterationsPerCombo ?? 1) * comboCount || comboCount;
+		const result = await this.doAsyncRequest(SimRequest.bulkComboSimAsync, BulkComboSimRequest.toBinary(request), id, worker, onProgress, totalIterations);
+		return result.finalComboResult!;
+	}
+
 	async raidSimRequestSplit(request: RaidSimRequestSplitRequest): Promise<RaidSimRequestSplitResult> {
 		const result = await this.makeApiCall(SimRequest.raidSimRequestSplit, RaidSimRequestSplitRequest.toBinary(request));
 		return RaidSimRequestSplitResult.fromBinary(result);
@@ -149,7 +181,7 @@ export class WorkerPool {
 	 * @returns The final ProgressMetrics.
 	 */
 	private async doAsyncRequest(
-		requestName: SimRequest.raidSimAsync | SimRequest.statWeightsAsync,
+		requestName: SimRequest.raidSimAsync | SimRequest.statWeightsAsync | SimRequest.bulkSimAsync | SimRequest.bulkComboSimAsync,
 		request: Uint8Array,
 		id: string,
 		worker: SimWorker,
@@ -184,7 +216,7 @@ export class WorkerPool {
 			onProgress(progress);
 			worker.updateSimTask(id, Math.max(1, progress.totalIterations - progress.completedIterations));
 			// If we are done, stop adding the handler.
-			if (progress.finalRaidResult != null || progress.finalWeightResult != null) {
+			if (progress.finalRaidResult != null || progress.finalWeightResult != null || progress.finalBulkResult != null || progress.finalComboResult != null) {
 				onFinal(progress);
 				return;
 			}
