@@ -72,3 +72,5 @@ jobs:
                       wowsimtbc-arm64-darwin.zip
                       wowsimtbc-amd64-linux.zip
                       wowsimtbc-windows.exe.zip
+
+# Release channel: public fork mirror (Titobenzo/tbc-new) for the WowSims launcher.
