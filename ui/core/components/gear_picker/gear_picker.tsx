@@ -205,6 +205,11 @@ export class ItemRenderer extends Component {
 					this.enchantElem.dataset.wowhead = url;
 				});
 			}
+			// This anchor sets its wowhead href directly (not via setWowheadHref), so
+			// give it the same new-tab safety net: a stray click must not navigate the
+			// SPA away — the left-click handler is meant to open the enchant picker.
+			this.enchantElem.target = '_blank';
+			this.enchantElem.rel = 'noopener noreferrer';
 			this.enchantElem.dataset.whtticon = 'false';
 			this.enchantElem.classList.remove('hide');
 		} else {

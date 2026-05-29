@@ -234,6 +234,14 @@ export class ActionId {
 		} else if (this.spellId) {
 			elem.href = ActionId.makeSpellUrl(this.spellIdTooltipOverride || this.spellId);
 		}
+		// Wowhead is always off-site. Many of these anchors double as in-app buttons
+		// (role="button") whose left-click is normally intercepted to open a picker/modal;
+		// the href is only here for the hover tooltip and right-click "open in new tab".
+		// If that click handler ever fails to attach (gem sockets and enchant links have
+		// render/lifecycle races where it can), a same-tab href would navigate the whole
+		// SPA away with no way back. Forcing a new tab keeps the app alive in that case.
+		elem.target = '_blank';
+		elem.rel = 'noopener noreferrer';
 	}
 
 	async setWowheadDataset(elem: HTMLElement, params?: Omit<WowheadTooltipItemParams, 'itemId'> | Omit<WowheadTooltipSpellParams, 'spellId'>) {
